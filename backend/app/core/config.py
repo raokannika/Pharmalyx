@@ -10,9 +10,12 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-2.5-flash"
 
-    # External APIs
+    # External APIs Configuration
     PUBMED_API_KEY: str = ""
     PUBMED_BASE_URL: str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+    PUBMED_EMAIL: str = "researcher@pharmalyx.com"
+    PUBMED_TOOL: str = "pharmalyx"
+
     CLINICALTRIALS_BASE_URL: str = "https://clinicaltrials.gov/api/v2"
 
     model_config = SettingsConfigDict(
