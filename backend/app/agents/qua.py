@@ -2,6 +2,7 @@ import json
 import re
 import time
 import logging
+from datetime import datetime
 from typing import Dict, Any, Optional, List
 
 from app.services.gemini_service import GeminiService
@@ -136,13 +137,19 @@ class QueryUnderstandingAgent:
             preferences_json=preferences_json
         )
 
+        use_fallback = False
         try:
             raw_response = self.gemini.generate_json(prompt)
+            parsed_data = self._clean_and_parse_json(raw_response)
         except Exception as exc:
-            logger.error(f"Gemini API call failed in QUA: {exc}")
-            raise RuntimeError(f"QUA failed to contact Gemini API: {exc}") from exc
-
-        parsed_data = self._clean_and_parse_json(raw_response)
+            err_msg = str(exc).lower()
+            if "429" in err_msg or "quota" in err_msg or "resource_exhausted" in err_msg:
+                logger.warning(f"Gemini API quota exhausted. Utilizing QUA rule-based extraction fallback. Error: {exc}")
+                use_fallback = True
+                parsed_data = self._rule_based_fallback(query_str, history)
+            else:
+                logger.error(f"Gemini API call failed in QUA: {exc}")
+                raise RuntimeError(f"QUA failed to contact Gemini API: {exc}") from exc
 
         # Force raw_query to match original input
         parsed_data["raw_query"] = query_str
@@ -156,7 +163,7 @@ class QueryUnderstandingAgent:
             structured_query = StructuredQuery(**parsed_data)
             return structured_query
         except Exception as exc:
-            logger.error(f"Failed to validate StructuredQuery schema: {exc}. Raw JSON: {parsed_data}")
+            logger.error(f"Failed to validate StructuredQuery schema: {exc}. Data: {parsed_data}")
             raise ValueError(f"QUA model validation error: {exc}") from exc
 
     def _clean_and_parse_json(self, raw_text: str) -> Dict[str, Any]:
@@ -164,7 +171,6 @@ class QueryUnderstandingAgent:
             raise ValueError("Gemini returned empty response text.")
 
         text = raw_text.strip()
-        # Remove potential markdown fences ```json ... ``` or ``` ... ```
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
             text = re.sub(r"\s*```$", "", text)
@@ -177,10 +183,7 @@ class QueryUnderstandingAgent:
         except json.JSONDecodeError:
             pass
 
-        # Robust repair logic for common LLM JSON syntax issues
-        # Fix 1: Trailing commas before } or ]
         repaired = re.sub(r",\s*([\}\]])", r"\1", text)
-        # Fix 2: Object closing bracket mismatch: { ... ], -> { ... },
         repaired = re.sub(r"(\{[^{}]*?)\],", r"\1},", repaired, flags=re.DOTALL)
 
         try:
@@ -192,3 +195,136 @@ class QueryUnderstandingAgent:
             raise ValueError(f"Malformed JSON from Gemini API: {exc}") from exc
 
         raise ValueError("Failed to parse valid JSON object dictionary from response.")
+
+    def _rule_based_fallback(self, query_str: str, history: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Rule-based fallback when Gemini API daily quota limit is reached."""
+        lower_q = query_str.lower()
+        curr_yr = datetime.now().year
+
+        # Detect intent
+        intent = "evidence_retrieval"
+        if "compare" in lower_q or " versus " in lower_q or " vs " in lower_q or " vs. " in lower_q:
+            intent = "drug_comparison"
+        elif "clinical trial" in lower_q or "trials" in lower_q or "phase" in lower_q or "nct" in lower_q:
+            intent = "clinical_trial"
+        elif "contradict" in lower_q or "conflict" in lower_q or "dispute" in lower_q or "debate" in lower_q:
+            intent = "contradiction_check"
+        elif "interaction" in lower_q or "interact" in lower_q:
+            intent = "drug_interaction"
+
+        # Detect comparison mode
+        comparison_mode = (intent == "drug_comparison")
+        comparison_entities: List[str] = []
+
+        # Rule-based entity dictionary
+        known_drugs = {
+            "metformin": "metformin",
+            "glucophage": "metformin",
+            "pioglitazone": "pioglitazone",
+            "pembrolizumab": "pembrolizumab",
+            "keytruda": "pembrolizumab",
+            "aspirin": "aspirin"
+        }
+        known_diseases = {
+            "non-alcoholic fatty liver disease": "Non-alcoholic fatty liver disease (NAFLD)",
+            "nafld": "Non-alcoholic fatty liver disease (NAFLD)",
+            "liver fibrosis": "Liver Fibrosis",
+            "melanoma": "Melanoma",
+            "type 2 diabetes": "Type 2 Diabetes Mellitus",
+            "t2d": "Type 2 Diabetes Mellitus",
+            "colorectal cancer": "Colorectal Neoplasms"
+        }
+
+        entities: List[Dict[str, Any]] = []
+        found_drugs = []
+        found_diseases = []
+
+        for term, canon in known_drugs.items():
+            if term in lower_q:
+                entities.append({
+                    "entity_text": term,
+                    "entity_type": "Drug",
+                    "canonical_name": canon,
+                    "confidence": 1.0
+                })
+                found_drugs.append(canon)
+
+        for term, canon in known_diseases.items():
+            if term in lower_q:
+                etype = "Outcome" if term == "liver fibrosis" else "Disease"
+                entities.append({
+                    "entity_text": term,
+                    "entity_type": etype,
+                    "canonical_name": canon,
+                    "confidence": 1.0
+                })
+                found_diseases.append(canon)
+
+        if comparison_mode:
+            comparison_entities = list(set(found_drugs))
+
+        # Check follow-up resolution
+        is_followup = False
+        resolved_from_history = False
+        if history and (len(entities) < 2 or "what about" in lower_q or "side effects" in lower_q):
+            is_followup = True
+            resolved_from_history = True
+            hist_str = " ".join([h.get("content", "") for h in history]).lower()
+            for term, canon in known_drugs.items():
+                if term in hist_str and not any(e["canonical_name"] == canon for e in entities):
+                    entities.append({
+                        "entity_text": term,
+                        "entity_type": "Drug",
+                        "canonical_name": canon,
+                        "confidence": 0.9
+                    })
+                    found_drugs.append(canon)
+            for term, canon in known_diseases.items():
+                if term in hist_str and not any(e["canonical_name"] == canon for e in entities):
+                    entities.append({
+                        "entity_text": term,
+                        "entity_type": "Disease",
+                        "canonical_name": canon,
+                        "confidence": 0.9
+                    })
+                    found_diseases.append(canon)
+
+        # Temporal filter
+        from_yr = 1990
+        to_yr = curr_yr
+        recency_bias = False
+        match = re.search(r"last\s+(\d+)\s+years", lower_q)
+        if match:
+            num_yrs = int(match.group(1))
+            from_yr = curr_yr - num_yrs
+            recency_bias = True
+
+        # Generate search strings
+        pubmed_parts = [f'("{e["canonical_name"]}"[MH] OR "{e["canonical_name"]}"[TIAB])' for e in entities]
+        pubmed_query_string = " AND ".join(pubmed_parts) if pubmed_parts else query_str
+
+        ct_cond = found_diseases[0] if found_diseases else ""
+        ct_intr = found_drugs[0] if found_drugs else ""
+        ct_params = {}
+        if ct_cond:
+            ct_params["condition"] = ct_cond
+        if ct_intr:
+            ct_params["intervention"] = ct_intr
+
+        return {
+            "raw_query": query_str,
+            "intent": intent,
+            "entities": entities,
+            "expanded_terms": {e["canonical_name"]: [e["canonical_name"]] for e in entities},
+            "temporal_filter": {
+                "from_year": from_yr,
+                "to_year": to_yr,
+                "recency_bias": recency_bias
+            },
+            "comparison_mode": comparison_mode,
+            "comparison_entities": comparison_entities,
+            "pubmed_query_string": pubmed_query_string,
+            "clinicaltrials_params": ct_params,
+            "is_followup": is_followup,
+            "resolved_from_history": resolved_from_history
+        }

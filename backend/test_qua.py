@@ -15,12 +15,24 @@ async def test_qua_agent():
     qua = QueryUnderstandingAgent()
     print("[SUCCESS] QUA initialized.")
 
+    # Helper function with retry for free-tier rate limits
+    async def process_with_retry(query: str, session_context=None, max_retries=3):
+        for attempt in range(max_retries):
+            try:
+                return await qua.process(query, session_context=session_context)
+            except Exception as e:
+                if ("429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)) and attempt < max_retries - 1:
+                    print(f"[INFO] Gemini API rate limit hit. Waiting 15s before retry (attempt {attempt+1}/{max_retries})...")
+                    await asyncio.sleep(15)
+                else:
+                    raise
+
     # -----------------------------------------------------------------
     # TEST 1: Evidence Retrieval Query
     # -----------------------------------------------------------------
     q1 = "Does metformin reduce liver fibrosis in non-alcoholic fatty liver disease?"
     print(f"\n[INFO] Test 1 Query: '{q1}'")
-    sq1 = await qua.process(q1)
+    sq1 = await process_with_retry(q1)
 
     assert isinstance(sq1, StructuredQuery), "Output must be StructuredQuery instance"
     assert sq1.intent == "evidence_retrieval", f"Expected intent 'evidence_retrieval', got '{sq1.intent}'"
@@ -38,24 +50,28 @@ async def test_qua_agent():
     print(f"         Extracted Entities: {[f'{e.canonical_name} ({e.entity_type})' for e in sq1.entities]}")
     print(f"         PubMed Query String: {sq1.pubmed_query_string}")
 
+    await asyncio.sleep(3)
+
     # -----------------------------------------------------------------
     # TEST 2: Clinical Trial Query
     # -----------------------------------------------------------------
     q2 = "What clinical trials are studying pembrolizumab for melanoma?"
     print(f"\n[INFO] Test 2 Query: '{q2}'")
-    sq2 = await qua.process(q2)
+    sq2 = await process_with_retry(q2)
 
     assert sq2.intent == "clinical_trial", f"Expected intent 'clinical_trial', got '{sq2.intent}'"
     assert len(sq2.clinicaltrials_params) > 0, "ClinicalTrials params must be generated"
     print("[SUCCESS] Clinical trial query processed.")
     print(f"         ClinicalTrials Params: {sq2.clinicaltrials_params}")
 
+    await asyncio.sleep(3)
+
     # -----------------------------------------------------------------
     # TEST 3: Drug Comparison Query
     # -----------------------------------------------------------------
     q3 = "Compare metformin and pioglitazone for type 2 diabetes."
     print(f"\n[INFO] Test 3 Query: '{q3}'")
-    sq3 = await qua.process(q3)
+    sq3 = await process_with_retry(q3)
 
     assert sq3.intent == "drug_comparison", f"Expected intent 'drug_comparison', got '{sq3.intent}'"
     assert sq3.comparison_mode is True, "comparison_mode must be True"
@@ -68,12 +84,14 @@ async def test_qua_agent():
     print("[SUCCESS] Drug comparison detected.")
     print(f"         Comparison Entities: {sq3.comparison_entities}")
 
+    await asyncio.sleep(3)
+
     # -----------------------------------------------------------------
     # TEST 4: Temporal Filter Query
     # -----------------------------------------------------------------
     q4 = "Show me studies from the last 5 years about aspirin and colorectal cancer."
     print(f"\n[INFO] Test 4 Query: '{q4}'")
-    sq4 = await qua.process(q4)
+    sq4 = await process_with_retry(q4)
 
     assert sq4.temporal_filter is not None, "Temporal filter must be present"
     assert sq4.temporal_filter.from_year is not None, "from_year should be set"
@@ -82,6 +100,8 @@ async def test_qua_agent():
 
     print("[SUCCESS] Temporal filter processed.")
     print(f"         Temporal Filter: {sq4.temporal_filter.from_year} to {sq4.temporal_filter.to_year}")
+
+    await asyncio.sleep(3)
 
     # -----------------------------------------------------------------
     # TEST 5: Follow-Up Query Resolution
@@ -93,7 +113,7 @@ async def test_qua_agent():
     q5 = "What about liver fibrosis?"
     print(f"\n[INFO] Test 5 Follow-up Query: '{q5}' with history context.")
 
-    sq5 = await qua.process(q5, session_context={"conversation_history": history})
+    sq5 = await process_with_retry(q5, session_context={"conversation_history": history})
 
     assert sq5.is_followup is True, "is_followup must be True"
     assert sq5.resolved_from_history is True, "resolved_from_history must be True"
